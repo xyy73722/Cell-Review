@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import numpy as np
-from scipy.io import loadmat, whosmat
+from scipy.io import loadmat
 
 
 def prepare(config_path, output):
@@ -18,17 +18,15 @@ def prepare(config_path, output):
 
 
 def prepare_selected_pair(reference, moving, data_root=DATA_ROOT):
-    folders = (reference, moving)
-    if reference == moving or reference.samefile(moving):
-        raise ValueError('Choose two different session folders.')
     inputs = []
-    for folder in folders:
-        for name in ('Fall.mat', 'footprints.mat', 'ops.npy'):
-            path = folder / name
-            if not path.is_file():
-                raise ValueError(f'Missing {name} in {folder}')
-            info = path.stat()
-            inputs.append((os.path.normcase(str(path)), info.st_size, info.st_mtime_ns))
+    for folder in (reference, moving):
+        path = folder / 'Fall.mat'
+        if not path.is_file():
+            raise ValueError(f'Missing Fall.mat in {folder}')
+        info = path.stat()
+        inputs.append((os.path.normcase(str(path)), info.st_size, info.st_mtime_ns))
+    if (reference / 'Fall.mat').samefile(moving / 'Fall.mat'):
+        raise ValueError('Choose two different sessions.')
     title = f'{reference.name} + {moving.name}'
     config = {'reference': str(reference), 'moving': str(moving), 'pair_name': title}
     if reference.parent == moving.parent and reference.parent.name.lower() == 'footprints':
@@ -65,27 +63,33 @@ def write_pair(config, output, config_path=None):
         folder = Path(config[key])
         # Fall.mat is the same curated source used by step0.m. Do not infer ROI
         # order from another copy of iscell.npy that may have different labels.
-        fall = loadmat(folder / 'Fall.mat', variable_names=['stat', 'iscell'], simplify_cells=True)
+        source = folder / 'Fall.mat'
+        fall = loadmat(source, variable_names=['stat', 'iscell', 'ops'], simplify_cells=True)
+        for name in ('stat', 'iscell'):
+            if name not in fall:
+                raise ValueError(f'Missing {name} in {source}.')
         stats = fall['stat']
         if isinstance(stats, dict):
             stats = [stats]
         stats = list(stats)
-        labels = np.atleast_2d(fall['iscell'])
+        labels = np.asarray(fall['iscell'])
+        if labels.ndim == 1 and len(stats) > 1:
+            labels = labels[:, None]
+        labels = np.atleast_2d(labels)
+        if labels.ndim != 2 or labels.shape[0] != len(stats) or not labels.shape[1]:
+            raise ValueError(f'iscell must contain one row per stat ROI in {source}.')
         merged = set()
         for stat in stats:
             merged.update(int(x) for x in np.asarray(stat.get('imerge', [])).reshape(-1))
         keep = np.array([i for i in range(len(stats)) if i not in merged and labels[i, 0] != 0], dtype=np.int32)
         if not len(keep):
             raise ValueError(f'No cell ROIs were found in {folder}.')
-        footprint_info = next((v for v in whosmat(folder / 'footprints.mat') if v[0] == 'spatial_footprints'), None)
-        if footprint_info is None:
-            raise ValueError(f'Missing spatial_footprints in {folder / "footprints.mat"}.')
-        if len(keep) != footprint_info[1][0]:
-            raise ValueError(f'{folder}: Fall.mat selection and footprints.mat ROI count differ.')
-        ops = np.load(folder / 'ops.npy', allow_pickle=True).item()
+        ops = fall.get('ops')
+        if not isinstance(ops, dict) or 'meanImg' not in ops:
+            raise ValueError(f'Missing ops.meanImg in {source}.')
         mean = np.asarray(ops['meanImg'], dtype=np.float32)
         if mean.ndim != 2 or not mean.size:
-            raise ValueError(f'Invalid mean image in {folder}.')
+            raise ValueError(f'ops.meanImg must be a nonempty 2D image in {source}.')
         enhanced = np.asarray(ops.get('meanImgE', mean), dtype=np.float32)
         if enhanced.shape != mean.shape:
             enhanced = mean.copy()
@@ -112,6 +116,7 @@ def write_pair(config, output, config_path=None):
                             'offsets': np.array(offsets, np.int32), 'original_ids': keep,
                             'centroids': np.array(centroids, dtype=np.float64)}.items():
             arrays[f'{prefix}_{name}'] = value
+        # Saved review files compare the entire session record, including the legacy f_path.
         metadata['sessions'].append({'name': folder.name, 'folder': str(folder),
                                      'n_rois': int(len(keep)), 'height': int(mean.shape[0]),
                                      'width': int(mean.shape[1]), 'f_path': str(folder / 'F.npy')})

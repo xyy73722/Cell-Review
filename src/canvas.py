@@ -18,23 +18,19 @@ def image_layer(values, color):
 
 
 def roi_outline(x, y):
-    """Trace exposed pixel edges in scene coordinates, including holes."""
+    """Make continuous contours along pixel edges, including holes and islands."""
     if not len(x):
         return G.QPainterPath()
     left, top = x.min(), y.min()
-    mask = np.zeros((y.max() - top + 3, x.max() - left + 3), dtype=bool)
-    mask[y - top + 1, x - left + 1] = True
-    core = mask[1:-1, 1:-1]
+    mask = np.zeros((y.max() - top + 1, x.max() - left + 3), dtype=np.int8)
+    mask[y - top, x - left + 1] = 1
+    edges = np.diff(mask, axis=1)
+    rows, starts = np.where(edges == 1)
+    _, stops = np.where(edges == -1)
     path = G.QPainterPath()
-    for neighbor, start, end in (
-        (mask[:-2, 1:-1], (0, 0), (1, 0)), (mask[2:, 1:-1], (0, 1), (1, 1)),
-        (mask[1:-1, :-2], (0, 0), (0, 1)), (mask[1:-1, 2:], (1, 0), (1, 1))
-    ):
-        ys, xs = np.where(core & ~neighbor)
-        for px, py in zip(xs + left, ys + top):
-            path.moveTo(px + start[0], py + start[1])
-            path.lineTo(px + end[0], py + end[1])
-    return path
+    for row, start, stop in zip(rows, starts, stops):
+        path.addRect(left + start, top + row, stop - start, 1)
+    return path.simplified()
 
 
 class Layers:
@@ -95,6 +91,7 @@ def qt_matrix(m):
 class Canvas(W.QWidget):
     picked = C.pyqtSignal(str, float, float)
     confirmRequested = C.pyqtSignal()
+    referencePickRequested = C.pyqtSignal(float, float)
     reopenRequested = C.pyqtSignal(str, float, float)
     shifted = C.pyqtSignal(float, float)
     shiftStarted = C.pyqtSignal()
@@ -112,6 +109,11 @@ class Canvas(W.QWidget):
         self.balance = 50
         self.pivot_mode = False
         self.selected = {'ref': None, 'mov': None}
+        self.dash_offset = 0
+        self.outline_rect = C.QRect()
+        self.outline_timer = C.QTimer(self)
+        self.outline_timer.setInterval(75)
+        self.outline_timer.timeout.connect(self.advance_outline)
         self.drag = None
         self.last = None
         self.setMinimumSize(120, 150)
@@ -134,6 +136,14 @@ class Canvas(W.QWidget):
 
     def fit(self):
         self.pose(C.QPointF(self.shape[1]/2, self.shape[0]/2), 1., True)
+
+    def advance_outline(self):
+        self.dash_offset = (self.dash_offset + 1) % 12
+        self.update(self.outline_rect)
+
+    def hideEvent(self, event):
+        self.outline_timer.stop()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         p = G.QPainter(self)
@@ -169,6 +179,7 @@ class Canvas(W.QWidget):
                 if self.role != 'overlay' and self.layers.confirmed_images[key] is not None:
                     p.drawImage(C.QPointF(), self.layers.confirmed_images[key])
                 p.restore()
+            outline_rect = C.QRect()
             for key in keys:
                 selected = self.selected[key]
                 if selected is None or (self.role != 'overlay' and selected in self.layers.confirmed_ids[key]):
@@ -176,15 +187,33 @@ class Canvas(W.QWidget):
                 p.save()
                 if key == 'mov':
                     p.setWorldTransform(qt_matrix(self.transform.matrix()), True)
-                color, width = SELECT, 2
-                if overlay:
-                    # A wider red stroke stays visible under coincident green edges.
-                    color, width = ('#ff3333', 4) if key == 'ref' else ('#39ff54', 2)
-                pen = G.QPen(G.QColor(color), width)
+                path = self.layers.paths[key, footprint_only][selected]
+                if path.isEmpty():
+                    p.restore()
+                    continue
+                bounds = p.worldTransform().mapRect(path.boundingRect()).toAlignedRect()
+                outline_rect |= bounds.adjusted(-4, -4, 4, 4)
+                color, width = ('#ff3333', 4) if key == 'ref' else ('#39ff54', 2.5)
+                p.setRenderHint(G.QPainter.Antialiasing)
+                pen = G.QPen()
                 pen.setCosmetic(True)
-                p.setPen(pen)
-                p.drawPath(self.layers.paths[key, footprint_only][selected])
+                pen.setJoinStyle(C.Qt.RoundJoin)
+                pen.setCapStyle(C.Qt.FlatCap)
+                # Keep the dark backing and the color in phase, with opposite phases for red and green.
+                offset = self.dash_offset + (6 if key == 'mov' else 0)
+                for ink, stroke in ((G.QColor(15, 19, 22, 210), width + 1.5), (G.QColor(color), width)):
+                    pen.setColor(ink)
+                    pen.setWidthF(stroke)
+                    pen.setDashPattern([6 / stroke, 6 / stroke])
+                    pen.setDashOffset(offset / stroke)
+                    p.setPen(pen)
+                    p.drawPath(path)
                 p.restore()
+            self.outline_rect = outline_rect.intersected(self.rect())
+            if self.outline_rect.isEmpty() or not self.isVisible():
+                self.outline_timer.stop()
+            elif not self.outline_timer.isActive():
+                self.outline_timer.start()
             if self.role == 'overlay' and (self.field != 'footprints' or self.pivot_mode):
                 x, y, _ = self.transform.pivot_scene()
                 delta = 7 / self.factor
@@ -274,7 +303,10 @@ class Canvas(W.QWidget):
             self.reopenRequested.emit(self.role, point.x(), point.y())
         elif event.button() == C.Qt.LeftButton and (gesture in ('roi', 'moving-roi')
                 or (gesture == 'background' and self.pivot_mode)):
-            self.picked.emit(self.role, point.x(), point.y())
+            if self.role == 'review' and event.modifiers() & C.Qt.ShiftModifier:
+                self.referencePickRequested.emit(point.x(), point.y())
+            else:
+                self.picked.emit(self.role, point.x(), point.y())
 
     def wheelEvent(self, event):
         steps = event.angleDelta().y() / 120

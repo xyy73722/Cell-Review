@@ -35,7 +35,7 @@ class SessionPicker(W.QDialog):
             row = W.QHBoxLayout()
             field = W.QLineEdit(current.meta['sessions'][index]['folder'] if current else '')
             field.setAccessibleName(title)
-            field.setPlaceholderText('Session folder containing footprints.mat')
+            field.setPlaceholderText('Session folder or full path to Fall.mat')
             self.fields.append(field)
             row.addWidget(field)
             browse = W.QPushButton('Browse…')
@@ -61,9 +61,10 @@ class SessionPicker(W.QDialog):
             self.fields[index].setText(folder)
 
     def load(self):
-        folders = tuple(Path(field.text().strip().strip('"')) for field in self.fields)
+        paths = (Path(field.text().strip().strip('"')) for field in self.fields)
+        folders = tuple(path.parent if path.name.lower() == 'fall.mat' else path for path in paths)
         if not all(folder.is_absolute() for folder in folders):
-            self.message.setText('Enter or browse to both session folders.')
+            self.message.setText('Choose both session folders or paste their full Fall.mat paths.')
             return
         if self.current and folders == tuple(Path(s['folder']) for s in self.current.meta['sessions']):
             self.data = self.current

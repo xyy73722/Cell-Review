@@ -10,6 +10,7 @@ from PyQt5 import QtCore as C, QtGui as G, QtWidgets as W
 from canvas import Canvas, Layers
 from model import Dataset, Transform, confirmed_pairs_at, dataset_for_review, export_track2p, pair_score, propose, read_review, save_review
 from session_picker import SessionPicker
+from traces import TracePanel
 
 
 STYLE = """
@@ -63,6 +64,23 @@ def card():
     layout.setContentsMargins(13, 12, 13, 12)
     layout.setSpacing(8)
     return frame, layout
+
+
+class ReviewStatusDelegate(W.QStyledItemDelegate):
+    backgrounds = {
+        'Confirmed': G.QColor('#bce8ca'),
+        'Pending': G.QColor('#e2e5e8'),
+        'Unmatched': G.QColor('#f8c7c7'),
+        'Suggested': G.QColor('#ffe693'),
+    }
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        color = self.backgrounds.get(option.text)
+        if color is not None:
+            # The ROI columns retain the row highlight; keep the status color visible.
+            option.state &= ~W.QStyle.State_Selected
+            option.backgroundBrush = G.QBrush(color)
 
 
 class ExportJob(C.QThread):
@@ -175,13 +193,15 @@ class Window(W.QMainWindow):
         self.views = [Canvas(key, data.ref.shape, self.layers, self.t) for key in ('ref','mov')]
         self.review_overlay = Canvas('review', data.ref.shape, self.layers, self.t)
         self.review_overlay.setCursor(C.Qt.CrossCursor)
+        self.review_overlay.setToolTip('Click another red ROI to switch. Shift+click selects red in an overlap.')
         self.canvases = [self.overlay, self.review_overlay, *self.views]
         self.pages.addWidget(self.alignment_page())
         self.pages.addWidget(self.review_page())
         self.overlay.picked.connect(self.pick)
         self.review_overlay.picked.connect(self.pick)
+        self.review_overlay.referencePickRequested.connect(lambda x, y: self.pick_on_overlay(x, y, force_red=True))
         for view in (self.review_overlay, *self.views):
-            view.confirmRequested.connect(self.confirm_picked_pair)
+            view.confirmRequested.connect(self.confirm_current_pair)
             view.reopenRequested.connect(self.reopen_at)
         self.overlay.shiftStarted.connect(self.remember)
         self.overlay.panStarted.connect(self.remember_pan)
@@ -290,7 +310,13 @@ class Window(W.QMainWindow):
             col.addWidget(view, 1)
             pair.addLayout(col, 1)
         self.review_images.addWidget(split)
-        box.addWidget(self.review_images, 1)
+        self.traces = TracePanel(self.data)
+        review_split = W.QSplitter(C.Qt.Vertical)
+        review_split.setChildrenCollapsible(False)
+        review_split.addWidget(self.review_images)
+        review_split.addWidget(self.traces)
+        review_split.setSizes([500, 160])
+        box.addWidget(review_split, 1)
         self.review_mode.currentIndexChanged.connect(self.review_mode_changed)
         layout.addWidget(images, 1)
         side, controls = card()
@@ -305,6 +331,7 @@ class Window(W.QMainWindow):
         controls.addLayout(row(button('Suggest Matches', self.generate), cellreg_btn))
         self.table = W.QTableWidget(self.data.ref.n, 3)
         self.table.setHorizontalHeaderLabels(['Reference ROI','Moving ROI','Status'])
+        self.table.setItemDelegateForColumn(2, ReviewStatusDelegate(self.table))
         self.table.setSelectionBehavior(W.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(W.QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
@@ -314,6 +341,8 @@ class Window(W.QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.Stretch)
         self.table.currentCellChanged.connect(self.row_changed)
+        self.table.cellClicked.connect(self.row_changed)
+        self.table.installEventFilter(self)
         controls.addWidget(self.table, 1)
         self.follow = W.QCheckBox('Zoom to ROI')
         self.follow.toggled.connect(lambda on: self.zoom_selected() if on else self.fit_review())
@@ -325,7 +354,7 @@ class Window(W.QMainWindow):
         controls.addLayout(row(label('Moving ROI'), self.mov_spin, self.follow))
         self.details = label('', 'muted', True)
         controls.addWidget(self.details)
-        self.accept_btn = button('Confirm Pair ↵', lambda: self.decide('accepted'), True)
+        self.accept_btn = button('Confirm Pair ↵', self.confirm_current_pair, True)
         self.absent_btn = button('Unmatched', lambda: self.decide('unmatched'))
         controls.addLayout(row(self.accept_btn, self.absent_btn))
         self.reopen_btn = button('Reopen ROI', self.reopen)
@@ -480,12 +509,12 @@ class Window(W.QMainWindow):
         choice = menu.exec_(G.QCursor.pos())
         return choice.data() if choice is not None else None
 
-    def pick_on_overlay(self, x, y):
-        expected = 'ref' if self.pick_step == 'red' else 'mov'
-        if expected not in self.review_overlay.roi_layers_at(C.QPointF(x, y)):
-            self.status('Select a red reference ROI.' if expected == 'ref' else 'Select a green moving ROI.')
+    def pick_on_overlay(self, x, y, *, force_red=False):
+        hits = self.review_overlay.roi_layers_at(C.QPointF(x, y))
+        select_red = force_red or self.pick_step == 'red' or 'mov' not in hits
+        if ('ref' if select_red else 'mov') not in hits:
             return
-        if self.pick_step == 'red':
+        if select_red:
             ref = self.pick_roi('ref', x, y)
             if ref is None:
                 self.status('Select a reference ROI in a red or yellow area.')
@@ -495,6 +524,7 @@ class Window(W.QMainWindow):
                 self.table.selectRow(ref)
             self.ref_id = ref
             if str(ref) in self.reviews:
+                self.pick_step = 'red'
                 self.status('This reference ROI has been reviewed. Reopen it to change the match.')
             else:
                 self.pick_step = 'green'
@@ -603,7 +633,7 @@ class Window(W.QMainWindow):
         self.refresh_selected()
 
     def row_changed(self, r, *args):
-        if r >= 0:
+        if r >= 0 and (r != self.ref_id or self.pick_step != 'red'):
             self.pick_step = 'red'
             self.ref_id = r
             self.refresh_selected()
@@ -639,14 +669,16 @@ class Window(W.QMainWindow):
             m = None
         self.restart_pick.setVisible(in_overlay)
         self.restart_pick.setEnabled(self.pick_step != 'red')
-        if not in_overlay:
+        if status == 'pending' and m is not None and self.pick_step == 'red':
+            hint = f'Suggested: red #{self.ref_id+1} ↔ green #{m+1}. Press Enter to confirm.'
+        elif not in_overlay:
             hint = 'Select the reference ROI on the left and its match on the right.'
         elif self.pick_step == 'red':
             hint = f'Select a red ROI in {self.data.ref.meta["name"]}.'
         elif waiting_green:
-            hint = f'Red #{self.ref_id+1} selected. Select a green ROI in {self.data.mov.meta["name"]}.'
+            hint = f'Red #{self.ref_id+1} selected. Click green to pair or another red to switch.'
         else:
-            hint = f'Red #{self.ref_id+1} ↔ green #{m+1}. Press Enter to confirm or select another green ROI.'
+            hint = f'Red #{self.ref_id+1} ↔ green #{m+1}. Press Enter to confirm.'
         self.pick_hint.setText(hint)
         with C.QSignalBlocker(self.mov_spin):
             self.mov_spin.setValue(0 if m is None else m+1)
@@ -660,6 +692,7 @@ class Window(W.QMainWindow):
             score, distance = pair_score(self.data,self.ref_id,m,self.t.matrix())
             detail += f' ↔ moving #{m+1} (Suite2p #{self.data.mov.original_ids[m]})\nIoU {score:.2f} · Centroid distance {distance:.1f} px'
         self.details.setText(detail)
+        self.traces.select(self.ref_id, m)
         show_ref = self.pick_step != 'red' or m is not None or not pending
         self.review_overlay.selected = {'ref': self.ref_id if show_ref else None, 'mov': m}
         self.review_overlay.update()
@@ -667,11 +700,18 @@ class Window(W.QMainWindow):
             view.selected = {'ref':self.ref_id, 'mov':m}
             view.update()
 
-    def confirm_picked_pair(self):
-        if self.pick_step == 'ready' and self.accept_btn.isEnabled():
+    def confirm_current_pair(self):
+        if self.accept_btn.isEnabled():
             self.decide('accepted')
 
     def eventFilter(self, watched, event):
+        if (event.type() == C.QEvent.KeyPress and watched is self.table
+                and event.key() in (C.Qt.Key_Return, C.Qt.Key_Enter)
+                and event.modifiers() in (C.Qt.NoModifier, C.Qt.KeypadModifier)):
+            if not event.isAutoRepeat():
+                self.confirm_current_pair()
+            event.accept()
+            return True
         # Spin boxes and the note editor normally intercept Undo before window shortcuts.
         if (event.type() == C.QEvent.ShortcutOverride and event.key() == C.Qt.Key_Z
                 and event.modifiers() == C.Qt.ControlModifier):
@@ -736,17 +776,20 @@ class Window(W.QMainWindow):
         else:
             entry = {'status':'unmatched'}
         reviews = {**self.reviews, key: entry}
+        reviewing_suggestion = status == 'accepted' and self.pick_step == 'red'
         self.apply_review(reviews, self.available(self.proposals, reviews))
-        self.next_pending()
+        self.next_pending(prefer_suggested=reviewing_suggestion)
 
-    def next_pending(self):
+    def next_pending(self, *, prefer_suggested=False):
         self.restart_pair()
-        for step in range(1, self.data.ref.n+1):
-            index = (self.ref_id+step) % self.data.ref.n
-            if str(index) not in self.reviews:
-                self.table.selectRow(index)
-                return
-        self.status('All reference ROIs have been reviewed.')
+        pending = [r for r in range(self.data.ref.n) if str(r) not in self.reviews]
+        if prefer_suggested:
+            pending = [r for r in pending if str(r) in self.proposals] or pending
+        if pending:
+            index = next((r for r in pending if r > self.ref_id), pending[0])
+            self.table.selectRow(index)
+        else:
+            self.status('All reference ROIs have been reviewed.')
 
     def reopen_at(self, role, x, y):
         refs = confirmed_pairs_at(self.data, self.reviews, self.t.matrix(), role, x, y)

@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from scipy.ndimage import affine_transform
 from scipy.optimize import linear_sum_assignment
-from scipy.io import savemat
+from scipy.io import loadmat, savemat
 from preview import write_preview
 
 
@@ -76,6 +76,20 @@ class Session:
             setattr(self, key, np.array(archive[f'{prefix}_{key}']))
         self.n = len(self.original_ids)
         self.shape = self.mean.shape
+
+    def read_fluorescence(self, roi_indices=None):
+        """Read raw Fall.mat F for all footprints or the requested footprint indices in order."""
+        source = Path(self.meta['folder']) / 'Fall.mat'
+        fields = loadmat(source, variable_names=['F', 'iscell'])
+        values = fields.get('F')
+        if values is None:
+            raise ValueError(f'{source} has no F variable.')
+        if (values.ndim != 2 or values.dtype.kind not in 'iuf' or not values.shape[1]
+                or 'iscell' not in fields or values.shape[0] != len(fields['iscell'])
+                or self.original_ids.min() < 0 or self.original_ids.max() >= values.shape[0]):
+            raise ValueError(f'F in {source} must contain one row per original Suite2p ROI and one column per frame.')
+        original_ids = self.original_ids if roi_indices is None else self.original_ids[roi_indices]
+        return values[original_ids]
 
     def footprint_samples(self, index):
         """Pixel centers use integer array indices here; weights follow the CellReg display cutoff."""
@@ -353,9 +367,7 @@ def _write_track2p(data, matrix, destination, final):
             if np.any(mask):
                 selected.append(index); masks.append(mask.astype(bool))
         masks = np.asarray(masks, dtype=bool).reshape(-1, *shape)
-        traces = np.load(session.meta['f_path'], mmap_mode='r')
-        original_ids = session.original_ids[selected]
-        np.save(folder / 'F.npy', np.asarray(traces[original_ids], dtype=np.float32))
+        np.save(folder / 'F.npy', session.read_fluorescence(selected).astype(np.float32, copy=False))
         np.save(folder / 'fov.npy', np.asarray(fov, dtype=np.float32))
         np.save(folder / 'rois.npy', masks)
         with (folder / 'roi_index_map.csv').open('w', newline='', encoding='utf-8-sig') as f:
