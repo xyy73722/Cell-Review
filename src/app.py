@@ -1,7 +1,8 @@
-"""Manual two-session alignment and cell review."""
+"""Manual alignment and cell review against a fixed reference session."""
 from paths import ROOT
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from PyQt5 import QtCore as C, QtGui as G, QtWidgets as W
 from canvas import Canvas, Layers
 from model import Dataset, Transform, confirmed_pairs_at, dataset_for_review, export_track2p, pair_score, propose, read_review, save_review
 from session_picker import SessionPicker
+from series import ReviewRound, check_next_dataset, read_series, save_series, visible_reference_ids
 from traces import TracePanel
 
 
@@ -137,21 +139,26 @@ class Window(W.QMainWindow):
         outer.addWidget(header)
         return outer, header_layout
 
-    def set_pair(self, data):
+    def set_pair(self, data, *, rounds=None, active=0, output=None):
+        self.rounds = rounds if rounds is not None else [ReviewRound.start(data)]
+        self.active_round = active
+        item = self.rounds[active]
+        pos = item.position
         self.layers = Layers(data)
         self.data = data
-        self.output_key = 'outputs/' + data.folder.name
-        results = self.results_override
+        series_name = self.rounds[0].data.folder.name
+        self.output_key = 'outputs/' + series_name
+        results = self.results_override or output
         if results is None:
-            results = self.settings.value(self.output_key, str(ROOT / 'results' / data.folder.name))
+            results = self.settings.value(self.output_key, str(ROOT / 'results' / series_name))
         self.results = Path(results).absolute()
-        self.t = self.identity()
-        self.reviews, self.proposals = {}, {}
+        self.t = copy.copy(item.transform)
+        self.reviews, self.proposals = dict(item.reviews), dict(item.proposals)
         self.undo_stack = []
         self.review_history = []
         self.candidate_generation = 0
         self.dirty = False
-        self.ref_id = 0
+        self.ref_id = pos.get('ref_id', 0)
         self.pick_step = 'red'
         self.last_saved = None
         outer, header_layout = self.build_header(data.meta['pair_name'])
@@ -176,8 +183,26 @@ class Window(W.QMainWindow):
         self.tabs.setSizePolicy(W.QSizePolicy.Fixed, W.QSizePolicy.Fixed)
         self.tabs.addTab('Alignment')
         self.tabs.addTab('Pair Review')
+        self.round_combo = W.QComboBox(page)
+        for i, review_round in enumerate(self.rounds, 2):
+            self.round_combo.addItem(f'Session {i} · {review_round.data.mov.meta["name"]}')
+        self.round_combo.setCurrentIndex(active)
+        self.round_combo.currentIndexChanged.connect(self.switch_round)
+        self.next_session_button = button('Next Session…' if active == len(self.rounds)-1 else 'Next Session →',
+                                          self.next_session)
+        self.show_hidden = W.QCheckBox('Show Hidden Reference ROIs', page)
+        self.show_hidden.setChecked(bool(pos.get('show_hidden', False)) and active > 0)
+        self.show_hidden.toggled.connect(self.filter_changed)
+        if len(self.rounds) > 1:
+            navigation = row(self.round_combo, self.next_session_button, self.show_hidden)
+            navigation.addStretch()
+            outer.addLayout(navigation)
+        self.round_combo.setVisible(len(self.rounds) > 1)
+        self.show_hidden.setVisible(active > 0)
         bar = W.QHBoxLayout()
         bar.addWidget(self.tabs)
+        if len(self.rounds) == 1:
+            bar.addWidget(self.next_session_button)
         bar.addStretch()
         self.channel = W.QComboBox()
         for title, field in [('ROI footprints only', 'footprints'), ('Enhanced mean image', 'enhanced'), ('Mean image', 'mean')]:
@@ -216,9 +241,84 @@ class Window(W.QMainWindow):
         self.log.setSizeGripEnabled(False)
         for edit in page.findChildren(W.QLineEdit):
             edit.installEventFilter(self)
+        self.note.setText(item.note)
+        self.channel.setCurrentIndex(max(0, self.channel.findData(item.image_field)))
+        self.update_reference_filter()
+        self.review_mode.setCurrentIndex(pos.get('mode', 0))
+        self.tabs.setCurrentIndex(pos.get('tab', 0))
+        self.follow.setChecked(bool(pos.get('follow', False)))
+        for view, pose in zip(self.canvases, pos.get('views', [])):
+            view.pose(C.QPointF(pose[0], pose[1]), pose[2])
+        step = pos.get('pick_step', 'red')
+        if self.ref_id == pos.get('ref_id') and self.ref_id is not None:
+            if step == 'green' or (step == 'ready' and self.entry(self.ref_id)[1] is not None):
+                self.pick_step = step
         self.update_display()
         self.sync_transform()
         self.refresh_list()
+
+    def snapshot_rounds(self):
+        rounds = self.rounds.copy()
+        position = {'ref_id': self.ref_id, 'show_hidden': self.show_hidden.isChecked(),
+                    'tab': self.tabs.currentIndex(), 'mode': self.review_mode.currentIndex(),
+                    'pick_step': self.pick_step, 'follow': self.follow.isChecked(),
+                    'views': [[v.center.x(), v.center.y(), v.zoom] for v in self.canvases]}
+        rounds[self.active_round] = ReviewRound(self.data, copy.copy(self.t), self.reviews.copy(),
+                                                self.proposals.copy(), self.note.text(),
+                                                self.channel.currentData(), position)
+        return rounds
+
+    def update_reference_filter(self):
+        ids = visible_reference_ids(self.data.ref.n, (r.reviews for r in self.rounds[:self.active_round]),
+                                    self.show_hidden.isChecked())
+        self.layers.set_visible('ref', self.data.ref, ids)
+        if self.ref_id not in ids:
+            self.ref_id = next((i for i in sorted(ids) if str(i) not in self.reviews), min(ids, default=None))
+            self.pick_step = 'red'
+        if self.overlay.selected['ref'] not in ids:
+            self.overlay.selected['ref'] = None
+
+    def filter_changed(self):
+        self.update_reference_filter()
+        self.refresh_list()
+        self.overlay.update()
+        self.mark_dirty()
+
+    def switch_round(self, index):
+        if index == self.active_round or self.job is not None:
+            return
+        if not self.apply_output_folder():
+            with C.QSignalBlocker(self.round_combo):
+                self.round_combo.setCurrentIndex(self.active_round)
+            return
+        rounds = self.snapshot_rounds()
+        self.set_pair(rounds[index].data, rounds=rounds, active=index, output=self.results)
+        self.mark_dirty()
+
+    def next_session(self):
+        if self.job is not None:
+            return
+        if self.active_round + 1 < len(self.rounds):
+            self.round_combo.setCurrentIndex(self.active_round + 1)
+            return
+        dialog = SessionPicker(self, self.data, append=True)
+        try:
+            if dialog.exec_() != W.QDialog.Accepted or not self.apply_output_folder():
+                return
+            data = dialog.data
+            rounds = self.snapshot_rounds()
+            check_next_dataset(rounds, data)
+            rounds[-1] = rounds[-1].completed()
+            rounds.append(ReviewRound.start(data))
+            index = len(rounds) - 1
+            folder = save_series(rounds, index, self.results)
+            self.set_pair(data, rounds=rounds, active=index, output=self.results)
+            self.last_saved = folder
+            self.status('Loaded the next session. Series progress saved to ' + str(folder))
+        except Exception as exc:
+            W.QMessageBox.warning(self, 'Could Not Add Session', str(exc))
+        finally:
+            dialog.deleteLater()
 
     def identity(self):
         h, w = self.data.mov.shape
@@ -496,9 +596,10 @@ class Window(W.QMainWindow):
     def pick_roi(self, key, x, y):
         session = self.data.ref if key == 'ref' else self.data.mov
         matrix = self.t.matrix() if key == 'mov' else None
+        ids = self.layers.reference_ids if key == 'ref' else range(session.n)
         if self.channel.currentData() != 'footprints':
-            return session.pick(x, y, matrix, radius=None)
-        hits = list(session.hits_at(x, y, range(session.n), footprint_only=True, matrix=matrix))
+            return session.pick(x, y, matrix, radius=None, indices=ids)
+        hits = list(session.hits_at(x, y, ids, footprint_only=True, matrix=matrix))
         if len(hits) < 2:
             return hits[0] if hits else None
         menu = W.QMenu(self)
@@ -594,13 +695,16 @@ class Window(W.QMainWindow):
     def use_candidates(self, candidates):
         self.candidate_generation += 1
         self.pick_step = 'red'
-        self.proposals = self.available(candidates)
+        ids = set(self.layers.reference_ids)
+        keep_hidden = {k: m for k, m in self.proposals.items() if int(k) not in ids}
+        shown = {str(r): m for r, m in candidates.items() if int(r) in ids}
+        self.proposals = self.available({**keep_hidden, **shown})
         self.mark_dirty()
         self.refresh_list()
-        self.status(f'Loaded {len(self.proposals)} match suggestions.')
+        self.status(f'Loaded {sum(int(k) in ids for k in self.proposals)} visible match suggestions.')
 
     def generate(self):
-        self.use_candidates(propose(self.data, self.t.matrix(), self.reviews))
+        self.use_candidates(propose(self.data, self.t.matrix(), self.reviews, reference_ids=self.layers.reference_ids))
 
     def cellreg(self):
         self.use_candidates(dict(self.data.meta.get('cellreg_pairs', [])))
@@ -624,16 +728,25 @@ class Window(W.QMainWindow):
 
     def refresh_list(self):
         self.layers.update_confirmed(self.data, self.reviews)
+        ids = set(self.layers.reference_ids)
         with C.QSignalBlocker(self.table):
             for r in range(self.data.ref.n):
                 self.refresh_row(r)
-            self.table.selectRow(self.ref_id)
-        n = sum(x['status']=='accepted' for x in self.reviews.values())
-        self.counts.setText(f'Confirmed {n} · Unmatched {len(self.reviews)-n} · Pending {self.data.ref.n-len(self.reviews)}')
+                self.table.setRowHidden(r, r not in ids)
+            if self.ref_id in ids:
+                self.table.selectRow(self.ref_id)
+            else:
+                self.table.setCurrentCell(-1, -1)
+        visible = [v for k, v in self.reviews.items() if int(k) in ids]
+        n = sum(x['status']=='accepted' for x in visible)
+        counts = f'Confirmed {n} · Unmatched {len(visible)-n} · Pending {len(ids)-len(visible)}'
+        if len(ids) < self.data.ref.n:
+            counts += f' · Hidden {self.data.ref.n-len(ids)}'
+        self.counts.setText(counts)
         self.refresh_selected()
 
     def row_changed(self, r, *args):
-        if r >= 0 and (r != self.ref_id or self.pick_step != 'red'):
+        if r in self.layers.reference_ids and (r != self.ref_id or self.pick_step != 'red'):
             self.pick_step = 'red'
             self.ref_id = r
             self.refresh_selected()
@@ -641,6 +754,8 @@ class Window(W.QMainWindow):
                 self.zoom_selected()
 
     def zoom_selected(self):
+        if self.ref_id is None:
+            return
         x,y = self.data.ref.centroids[self.ref_id]
         center = C.QPointF(x,y)
         self.review_overlay.pose(center, 5.)
@@ -648,7 +763,7 @@ class Window(W.QMainWindow):
 
     def choose_moving(self, value):
         key = str(self.ref_id)
-        if key in self.reviews:
+        if self.ref_id is None or key in self.reviews:
             return
         self.pick_step = 'ready' if value else 'red'
         if not value and self.review_mode.currentIndex() == 0:
@@ -662,6 +777,18 @@ class Window(W.QMainWindow):
         self.refresh_selected()
 
     def refresh_selected(self):
+        if self.ref_id is None:
+            self.pick_hint.setText('No continuous reference ROIs. Select Show Hidden Reference ROIs to review others.')
+            for widget in (self.accept_btn, self.absent_btn, self.reopen_btn, self.mov_spin, self.restart_pick):
+                widget.setEnabled(False)
+            with C.QSignalBlocker(self.mov_spin):
+                self.mov_spin.setValue(0)
+            self.details.clear()
+            self.traces.select(None, None)
+            for view in (self.review_overlay, *self.views):
+                view.selected = {'ref': None, 'mov': None}
+                view.update()
+            return
         status, m = self.entry(self.ref_id)
         in_overlay = self.review_mode.currentIndex() == 0
         waiting_green = in_overlay and self.pick_step == 'green'
@@ -727,6 +854,8 @@ class Window(W.QMainWindow):
             self.status('No review action to undo.')
             return
         self.ref_id, old_reviews, candidate_changes, generation = self.review_history.pop()
+        if self.ref_id is not None and self.ref_id not in self.layers.reference_ids:
+            self.show_hidden.setChecked(True)
         for key, old in old_reviews.items():
             if old is None:
                 self.reviews.pop(key, None)
@@ -743,7 +872,7 @@ class Window(W.QMainWindow):
         self.pick_step = 'red'
         self.mark_dirty()
         self.refresh_list()
-        self.status(f'Review action undone for reference ROI #{self.ref_id+1}.')
+        self.status('Review action undone.' if self.ref_id is None else f'Review action undone for reference ROI #{self.ref_id+1}.')
 
     def apply_review(self, reviews, proposals):
         old_reviews = {k: self.reviews.get(k) for k in self.reviews.keys() | reviews.keys()
@@ -760,7 +889,7 @@ class Window(W.QMainWindow):
 
     def decide(self, status):
         key = str(self.ref_id)
-        if key in self.reviews:
+        if self.ref_id is None or key in self.reviews:
             return
         if status=='accepted':
             if self.pick_step == 'green':
@@ -782,7 +911,7 @@ class Window(W.QMainWindow):
 
     def next_pending(self, *, prefer_suggested=False):
         self.restart_pair()
-        pending = [r for r in range(self.data.ref.n) if str(r) not in self.reviews]
+        pending = [r for r in self.layers.reference_ids if str(r) not in self.reviews]
         if prefer_suggested:
             pending = [r for r in pending if str(r) in self.proposals] or pending
         if pending:
@@ -792,7 +921,13 @@ class Window(W.QMainWindow):
             self.status('All reference ROIs have been reviewed.')
 
     def reopen_at(self, role, x, y):
-        refs = confirmed_pairs_at(self.data, self.reviews, self.t.matrix(), role, x, y)
+        refs = set()
+        if role in ('review', 'ref'):
+            visible = {k: v for k, v in self.reviews.items() if int(k) in self.layers.reference_ids}
+            refs.update(confirmed_pairs_at(self.data, visible, self.t.matrix(), 'ref', x, y))
+        if role in ('review', 'mov'):
+            refs.update(confirmed_pairs_at(self.data, self.reviews, self.t.matrix(), 'mov', x, y))
+        refs = sorted(refs)
         if not refs:
             return
         ref = refs[0]
@@ -808,6 +943,8 @@ class Window(W.QMainWindow):
                 return
             ref = selected.data()
         moving = self.reviews[str(ref)]['moving']
+        if ref not in self.layers.reference_ids:
+            self.show_hidden.setChecked(True)
         self.ref_id = ref
         self.reopen()
         self.status(f'Reopened the pair for reference #{ref+1} and moving #{moving+1}.')
@@ -869,7 +1006,10 @@ class Window(W.QMainWindow):
         if not self.apply_output_folder():
             return False
         try:
-            self.last_saved = save_review(self.data,self.t,self.reviews,self.proposals,self.results,self.note.text(), self.channel.currentData())
+            if len(self.rounds) > 1:
+                self.last_saved = save_series(self.snapshot_rounds(), self.active_round, self.results)
+            else:
+                self.last_saved = save_review(self.data,self.t,self.reviews,self.proposals,self.results,self.note.text(), self.channel.currentData())
         except Exception as exc:
             W.QMessageBox.warning(self,'Could Not Save Progress',str(exc))
             return False
@@ -880,6 +1020,19 @@ class Window(W.QMainWindow):
     def finish_review(self):
         if not self.apply_output_folder():
             return False
+        if len(self.rounds) > 1:
+            rounds = self.snapshot_rounds()
+            try:
+                folder = save_series(rounds, self.active_round, self.results, final=True)
+            except Exception as exc:
+                W.QMessageBox.warning(self, 'Could Not Export MAT', str(exc))
+                return False
+            self.rounds = [r.completed() for r in rounds]
+            self.apply_review(self.rounds[self.active_round].reviews, {})
+            self.last_saved = folder
+            self.dirty = False
+            self.status('Multi-session MAT and progress saved to ' + str(folder))
+            return True
         completed = dict(self.reviews)
         for i in range(self.data.ref.n):
             completed.setdefault(str(i), {'status': 'unmatched'})
@@ -913,9 +1066,16 @@ class Window(W.QMainWindow):
         dialog.deleteLater()
 
     def restore(self, path):
+        state = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        if state.get('format_version') == 2:
+            rounds, index = read_series(state, self.data)
+            self.set_pair(rounds[index].data, rounds=rounds, active=index, output=state.get('output_folder'))
+            self.last_saved = Path(path).parent
+            self.status('Opened ' + str(path))
+            return
         data = dataset_for_review(path, self.data)
         t, reviews, proposals, note, field = read_review(path, data, with_image_field=True)
-        if data is not self.data:
+        if data is not self.data or len(self.rounds) > 1:
             self.set_pair(data)
         channel = self.channel.findData(field or 'footprints')
         self.channel.setCurrentIndex(max(0, channel))
@@ -949,6 +1109,8 @@ class Window(W.QMainWindow):
         self.export_btn.setEnabled(False)
         self.session_button.setEnabled(False)
         self.open_button.setEnabled(False)
+        self.next_session_button.setEnabled(False)
+        self.round_combo.setEnabled(False)
         self.status('Exporting the transform, ROI masks and fluorescence traces…')
         self.job = ExportJob(self.data,self.t.matrix(),self.results)
         self.job.done.connect(self.export_done)
@@ -966,6 +1128,8 @@ class Window(W.QMainWindow):
         self.export_btn.setEnabled(True)
         self.session_button.setEnabled(True)
         self.open_button.setEnabled(True)
+        self.next_session_button.setEnabled(True)
+        self.round_combo.setEnabled(True)
 
     def closeEvent(self, event):
         if self.job is not None:

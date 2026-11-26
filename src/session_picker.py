@@ -22,32 +22,40 @@ class PairLoader(C.QThread):
 
 
 class SessionPicker(W.QDialog):
-    def __init__(self, parent=None, current=None):
+    def __init__(self, parent=None, current=None, *, append=False):
         super().__init__(parent)
-        self.setWindowTitle('Select Sessions')
+        self.append = append
+        self.setWindowTitle('Next Session' if append else 'Select Sessions')
         self.current = current
         self.data = None
         self.job = None
         layout = W.QVBoxLayout(self)
         self.fields = []
-        for index, title in enumerate(('Session 1 · Reference (red)', 'Session 2 · Moving (green)')):
+        moving_title = 'Next session · Moving (green)' if append else 'Session 2 · Moving (green)'
+        for index, title in enumerate(('Session 1 · Reference (red)', moving_title)):
             layout.addWidget(W.QLabel(title))
             row = W.QHBoxLayout()
-            field = W.QLineEdit(current.meta['sessions'][index]['folder'] if current else '')
+            field = W.QLineEdit(current.meta['sessions'][index]['folder']
+                                if current and not (append and index == 1) else '')
+            field.setReadOnly(append and index == 0)
             field.setAccessibleName(title)
             field.setPlaceholderText('Session folder or full path to Fall.mat')
             self.fields.append(field)
             row.addWidget(field)
             browse = W.QPushButton('Browse…')
             browse.setAutoDefault(False)
+            if field.isReadOnly():
+                browse.hide()
             browse.clicked.connect(lambda checked=False, i=index: self.browse(i))
             row.addWidget(browse)
             layout.addLayout(row)
         self.message = W.QLabel()
+        if append:
+            self.message.setText('Loading the next session saves this round and marks its unconfirmed ROIs as unmatched.')
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         buttons = W.QDialogButtonBox(W.QDialogButtonBox.Open | W.QDialogButtonBox.Cancel)
-        buttons.button(W.QDialogButtonBox.Open).setText('Load Pair')
+        buttons.button(W.QDialogButtonBox.Open).setText('Load Session' if append else 'Load Pair')
         buttons.accepted.connect(self.load)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -56,7 +64,12 @@ class SessionPicker(W.QDialog):
     def browse(self, index):
         value = self.fields[index].text().strip().strip('"')
         initial = str(Path(value).parent) if value else self.fields[0].text()
-        folder = W.QFileDialog.getExistingDirectory(self, f'Select Session {index+1}', initial)
+        if self.append:
+            initial = value or str(Path(self.current.mov.meta['folder']).parent)
+            folder, _ = W.QFileDialog.getOpenFileName(self, 'Select the next Fall.mat', initial,
+                                                       'Suite2p session (Fall.mat)')
+        else:
+            folder = W.QFileDialog.getExistingDirectory(self, f'Select Session {index+1}', initial)
         if folder:
             self.fields[index].setText(folder)
 

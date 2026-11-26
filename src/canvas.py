@@ -46,31 +46,43 @@ class Layers:
                 norm = normalize_image(getattr(session, field))
                 self.images[key, field, True] = image_layer(norm, tint)
                 self.images[key, field, False] = image_layer(norm, (255, 255, 255))
-            projection = session.footprint_projection()
-            self.roi_masks[key, True] = projection > 0
-            full_mask = np.zeros(session.shape, dtype=bool)
-            full_mask[session.y, session.x] = True
-            self.roi_masks[key, False] = full_mask
-            color = (255, 0, 0) if key == 'ref' else (0, 255, 0)
-            footprint = image_layer(projection, color)
-            self.images[key, 'footprints', True] = footprint
-            self.images[key, 'footprints', False] = footprint
             for footprint_only in (False, True):
                 paths = []
-                combined = G.QPainterPath()
                 for i in range(session.n):
                     xy = session.footprint_samples(i)[:2] if footprint_only else session.pixels(i)
-                    path = roi_outline(*xy)
-                    paths.append(path)
-                    combined.addPath(path)
+                    paths.append(roi_outline(*xy))
                 self.paths[key, footprint_only] = paths
-                self.outlines[key, footprint_only] = combined
+            self.set_visible(key, session, range(session.n))
+
+    def set_visible(self, key, session, indices):
+        ids = tuple(sorted(indices))
+        if key == 'ref':
+            if getattr(self, 'reference_ids', None) == ids:
+                return
+            self.reference_ids = ids
+        projection = session.footprint_projection(ids)
+        self.roi_masks[key, True] = projection > 0
+        full_mask = np.zeros(session.shape, dtype=bool)
+        for i in ids:
+            x, y = session.pixels(i)
+            full_mask[y, x] = True
+        self.roi_masks[key, False] = full_mask
+        footprint = image_layer(projection, (255, 0, 0) if key == 'ref' else (0, 255, 0))
+        for overlay in (False, True):
+            self.images[key, 'footprints', overlay] = footprint
+        for footprint_only in (False, True):
+            combined = G.QPainterPath()
+            for i in ids:
+                combined.addPath(self.paths[key, footprint_only][i])
+            self.outlines[key, footprint_only] = combined
 
     def update_confirmed(self, data, reviews):
         accepted = [(int(ref), entry['moving']) for ref, entry in reviews.items()
                     if entry['status'] == 'accepted']
         for key, session, column in [('ref', data.ref, 0), ('mov', data.mov, 1)]:
             ids = frozenset(pair[column] for pair in accepted)
+            if key == 'ref':
+                ids = ids.intersection(self.reference_ids)
             if ids == self.confirmed_ids[key]:
                 continue
             self.confirmed_ids[key] = ids

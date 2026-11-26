@@ -10,10 +10,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
-VERSION = "0.1.7"
+VERSION = "0.2.0"
 NAME = "Cell Review"
-MODULES = ("app", "canvas", "model", "paths", "prepare_data", "preview", "session_picker", "traces")
-PUBLIC_FILES = ("README.md", "LICENSE", "LGPL-3.0.txt", "THIRD_PARTY.md", ".gitignore",
+MODULES = ("app", "canvas", "model", "paths", "prepare_data", "preview", "series", "session_picker", "traces")
+PUBLIC_FILES = ("README.md", "CHANGELOG.md", "LICENSE", "LGPL-3.0.txt", "THIRD_PARTY.md", ".gitignore",
                 "requirements.txt", "requirements-build.txt", "build_release.py")
 RUNTIME_PACKAGES = ("numpy", "scipy", "Pillow", "h5py", "PyQt5", "PyQt5-Qt5",
                     "PyQt5-sip", "PyInstaller")
@@ -89,7 +89,7 @@ def main():
                         "--workpath", str(scratch / "build"), "--specpath", str(scratch),
                         str(source / "src/app.py")], cwd=source, env=env, check=True)
         app = scratch / "dist" / NAME
-        for name in ("README.md", "LICENSE", "THIRD_PARTY.md"):
+        for name in ("README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY.md"):
             shutil.copyfile(source / name, app / name)
         shutil.copytree(source, app / "source")
         collect_licenses(app / "licenses")

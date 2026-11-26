@@ -129,16 +129,20 @@ class Session:
             if np.any((px == ix) & (py == iy)):
                 yield int(index)
 
-    def pick(self, x, y, matrix=None, radius=8, footprint_only=False):
+    def pick(self, x, y, matrix=None, radius=8, footprint_only=False, indices=None):
         if matrix is not None:
             x, y, _ = np.linalg.inv(matrix) @ [x, y, 1]
         distances = np.linalg.norm(self.centroids - [x, y], axis=1)
-        hit = next(self.hits_at(x, y, np.argsort(distances), footprint_only), None)
+        ids = np.arange(self.n) if indices is None else np.asarray(indices, dtype=int)
+        if not ids.size:
+            return None
+        order = ids[np.argsort(distances[ids])]
+        hit = next(self.hits_at(x, y, order, footprint_only), None)
         if hit is not None:
             return hit
         if radius is None:
             return None
-        index = int(np.argmin(distances))
+        index = int(order[0])
         return index if distances[index] <= radius else None
 
 
@@ -189,9 +193,9 @@ def pair_score(data, ref_id, mov_id, matrix):
     return float(iou), float(np.linalg.norm(rc - mc))
 
 
-def propose(data, matrix, reviews, radius=18.0):
+def propose(data, matrix, reviews, radius=18.0, reference_ids=None):
     """Only propose: never convert an algorithm suggestion into a confirmation."""
-    refs = [r for r in range(data.ref.n) if str(r) not in reviews]
+    refs = [r for r in (range(data.ref.n) if reference_ids is None else reference_ids) if str(r) not in reviews]
     used = {int(v['moving']) for v in reviews.values() if v['status'] == 'accepted'}
     movs = [m for m in range(data.mov.n) if m not in used]
     proposals = {}
@@ -244,7 +248,17 @@ def new_result(root, prefix):
 
 
 def dataset_for_review(path, current=None):
+    return dataset_for_state(active_review_record(path), current)
+
+
+def active_review_record(path):
     state = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    if state.get('format_version') == 2:
+        return state['rounds'][state['active_round']]
+    return state
+
+
+def dataset_for_state(state, current=None):
     if state.get('prepared_path'):
         folder = Path(state['prepared_path'])
         if current is not None and folder == current.folder:
@@ -264,7 +278,10 @@ def dataset_for_review(path, current=None):
 
 
 def read_review(path, data, *, with_image_field=False):
-    state = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    return review_values(active_review_record(path), data, with_image_field=with_image_field)
+
+
+def review_values(state, data, *, with_image_field=False):
     if state['format_version'] != 1 or state['source_sessions'] != data.meta['sessions']:
         raise ValueError('The sessions or data version in this progress file do not match the current pair.')
     transform = Transform(**state['transform'])
@@ -310,13 +327,17 @@ def save_review(data, transform, reviews, proposals, root, note='', image_field=
     return final
 
 
-def _write_review(data, transform, reviews, proposals, destination, note, image_field, progress):
-    validate_reviews(reviews, data)
-    state = {'format_version': 1, 'pair_name': data.meta['pair_name'],
+def review_record(data, transform, reviews, proposals, note, image_field):
+    return {'format_version': 1, 'pair_name': data.meta['pair_name'],
              'prepared_path': str(data.folder), 'source_sessions': data.meta['sessions'],
              'transform': asdict(transform), 'moving_to_reference_matrix': transform.matrix().tolist(),
              'reviews': reviews, 'proposals': proposals, 'note': note, 'image_field': image_field,
              'id_convention': 'footprint IDs 1-based; Suite2p IDs 0-based in labeled columns'}
+
+
+def _write_review(data, transform, reviews, proposals, destination, note, image_field, progress):
+    validate_reviews(reviews, data)
+    state = review_record(data, transform, reviews, proposals, note, image_field)
     if progress is not None:
         (destination / 'session_final.json').write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
         state.update(reviews=progress[0], proposals=progress[1])
